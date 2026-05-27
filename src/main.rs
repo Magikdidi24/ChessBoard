@@ -329,6 +329,13 @@ fn save_king(board :Board,index: usize) -> Vec<usize> {
     legal
 }
 
+fn is_checkmate(board :Board, index :usize) -> bool{
+    if let Some(piece) = board.get(index) && is_in_check(board,piece.color) && save_king(board, index) == vec![]{
+        return true;
+    }
+    false
+}
+
 #[macroquad::main("Chess")]
 async fn main() {
     let b_b = load_texture("pieces/bB.png").await.unwrap();
@@ -405,6 +412,7 @@ async fn main() {
             if selected.is_none() && board.square[index_start].is_some() && let Some(a) = board.get(index_start) && a.color == who_play{
                 selected = Some(index_start);
                 if move_pieces.is_none(){
+                    if is_checkmate(board, index_start){return;}
                     move_pieces = Some(save_king(board, index_start));
                 }
             }
