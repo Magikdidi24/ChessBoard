@@ -1,502 +1,332 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::thread;
+use std::time::Duration;
+
 use macroquad::{
-    color::{BEIGE, BROWN, WHITE}, input::{MouseButton, is_mouse_button_pressed, mouse_position}, math::vec2, miniquad::window, shapes::{draw_circle, draw_rectangle}, texture::{DrawTextureParams, draw_texture_ex, load_texture}, window::{clear_background, next_frame}
+    color::{BEIGE, BLACK, BROWN, WHITE},
+    input::{KeyCode, MouseButton, is_key_pressed, is_mouse_button_pressed, mouse_position},
+    math::vec2,
+    shapes::{draw_circle, draw_rectangle},
+    text::draw_text,
+    texture::{DrawTextureParams, draw_texture_ex, load_texture},
+    window::{Conf, clear_background, next_frame},
 };
 
+mod board;
+mod engine;
+mod moves;
+
+use board::{Board, Color, Piece, PieceType, START_FEN, fen_to_board};
+use engine::{MATE, SearchResult};
+use moves::{Move, Status, game_status, is_in_check, make_move, save_king};
+
 const SQUARE_SIZE: f32 = 100.0;
-const KING_MOVES: [[(isize, isize); 1]; 8] = [
-    [(-1, -1)], [(-1, 0)], [(-1, 1)],
-    [( 0, -1)],            [( 0, 1)],
-    [( 1, -1)], [( 1, 0)], [( 1, 1)],
-];
-const ROOK_MOVES: [[(isize, isize); 7]; 4] = [
-    [(-1, 0), (-2, 0), (-3, 0), (-4, 0), (-5, 0), (-6, 0), (-7, 0)], // up
-    [( 1, 0), ( 2, 0), ( 3, 0), ( 4, 0), ( 5, 0), ( 6, 0), ( 7, 0)], // down
-    [(0, -1), (0, -2), (0, -3), (0, -4), (0, -5), (0, -6), (0, -7)], // left
-    [(0,  1), (0,  2), (0,  3), (0,  4), (0,  5), (0,  6), (0,  7)], // right
-];
-const BISHOP_MOVES: [[(isize, isize); 7]; 4] = [
-    [(-1, -1), (-2, -2), (-3, -3), (-4, -4), (-5, -5), (-6, -6), (-7, -7)], // up-left
-    [( 1, -1), ( 2, -2), ( 3, -3), ( 4, -4), ( 5, -5), ( 6, -6), ( 7, -7)], // up-right
-    [(-1,  1), (-2,  2), (-3,  3), (-4,  4), (-5,  5), (-6,  6), (-7,  7)], // down-left
-    [( 1,  1), ( 2,  2), ( 3,  3), ( 4,  4), ( 5,  5), ( 6,  6), ( 7,  7)], // down-right
-];
+const BOARD_SIZE: f32 = SQUARE_SIZE * 8.0;
+const STATUS_HEIGHT: f32 = 60.0;
 
-const KNIGHT_MOVES: [[(isize, isize); 1]; 8] = [
-    [(-1, -2)],[(-2, -1)],[(1, -2)],[(-2, 1)],[(2, -1)],[(-1, 2)],[(1, 2)],[(2, 1)],
+/// Thinking time per engine move. The search runs in its own thread, so the
+/// window keeps refreshing meanwhile.
+const ENGINE_TIME: Duration = Duration::from_secs(1);
+const ENGINE_MAX_DEPTH: u32 = 32;
+
+type Rgba = macroquad::color::Color;
+const MOVE_DOT: Rgba = Rgba::new(0.0, 0.0, 1.0, 0.4);
+const SELECTED: Rgba = Rgba::new(0.0, 1.0, 0.0, 0.4);
+const LAST_MOVE: Rgba = Rgba::new(1.0, 1.0, 0.0, 0.35);
+const SHADOW: Rgba = Rgba::new(0.0, 0.0, 0.0, 0.5);
+
+/// Piece images in `PieceType` order (King, Pawn, Knight, Bishop, Rook, Queen),
+/// white then black, so a piece's image is at `kind as usize * 2 + color as usize`.
+const PIECE_FILES: [&str; 12] = [
+    "wK", "bK", "wP", "bP", "wN", "bN", "wB", "bB", "wR", "bR", "wQ", "bQ",
 ];
 
-const QUEEN_MOVES: [[(isize, isize); 7]; 8] = [
-    [(-1, 0), (-2, 0), (-3, 0), (-4, 0), (-5, 0), (-6, 0), (-7, 0)],  // up
-    [( 1, 0), ( 2, 0), ( 3, 0), ( 4, 0), ( 5, 0), ( 6, 0), ( 7, 0)],  // down
-    [(0, -1), (0, -2), (0, -3), (0, -4), (0, -5), (0, -6), (0, -7)],  // left
-    [(0,  1), (0,  2), (0,  3), (0,  4), (0,  5), (0,  6), (0,  7)],  // right
-    [(-1, -1), (-2, -2), (-3, -3), (-4, -4), (-5, -5), (-6, -6), (-7, -7)],  // up-left
-    [( 1, -1), ( 2, -2), ( 3, -3), ( 4, -4), ( 5, -5), ( 6, -6), ( 7, -7)],  // up-right
-    [(-1,  1), (-2,  2), (-3,  3), (-4,  4), (-5,  5), (-6,  6), (-7,  7)],  // down-left
-    [( 1,  1), ( 2,  2), ( 3,  3), ( 4,  4), ( 5,  5), ( 6,  6), ( 7,  7)],  // down-right
+const PROMOTION_CHOICES: [PieceType; 4] = [
+    PieceType::Queen,
+    PieceType::Rook,
+    PieceType::Bishop,
+    PieceType::Knight,
 ];
 
-
-#[derive(Clone, Copy, PartialEq)]
-enum PieceType { King, Pawn, Knight, Bishop, Rook, Queen }
-
-#[derive(Clone, Copy, PartialEq)]
-enum Color { White, Black }
-
-#[derive(Clone, Copy, PartialEq)]
-struct Piece {
-    kind: PieceType,
-    color: Color,
-}
-#[derive(Clone,Copy)]
-struct Board {
-    square: [Option<Piece>; 64],
-    black_play : bool,
-    white_play : bool,
-    can_rook_black_small : bool,
-    can_rook_black_big : bool,
-    can_rook_white_small : bool,
-    can_rook_white_big : bool,
-    number_of_half_moves : u64,
-    number_of_moves : u64,
+fn window_conf() -> Conf {
+    Conf {
+        window_title: "Chess".to_owned(),
+        window_width: BOARD_SIZE as i32,
+        window_height: (BOARD_SIZE + STATUS_HEIGHT) as i32,
+        window_resizable: false,
+        ..Default::default()
+    }
 }
 
-impl Board {
+/// A search running in its own thread. Dropping it (restart, mode switch) tells
+/// that search to stop instead of letting it burn a core until its time is up.
+struct Thinking {
+    rx: Receiver<SearchResult>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Drop for Thinking {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+struct Game {
+    board: Board,
+    /// Positions before `board`, for threefold repetition.
+    history: Vec<Board>,
+    status: Status,
+    last_move: Option<Move>,
+}
+
+impl Game {
     fn new() -> Self {
-        Board { 
-            square: [const { None }; 64], 
-            black_play: false,
-            white_play: true,
-            can_rook_black_big:true,
-            can_rook_white_small:true,
-            can_rook_white_big:true,
-            can_rook_black_small:true,
-            number_of_half_moves:0,
-            number_of_moves:1,
+        Game {
+            board: fen_to_board(START_FEN),
+            history: vec![],
+            status: Status::Ongoing,
+            last_move: None,
         }
     }
-    fn set(&mut self, index: usize, piece: Piece) {
-        self.square[index] = Some(piece);
-    }
-    fn get(&self, index: usize) -> Option<Piece> {
-        self.square[index]
+
+    fn play(&mut self, m: Move) {
+        self.history.push(self.board);
+        self.board = make_move(self.board, m);
+        self.last_move = Some(m);
+        self.status = game_status(&self.board, &self.history);
     }
 }
 
-fn fen_to_board(mut board: Board, s: String) -> Board{
-    let mut i: u8=0;
-    let mut space: i32 = 0;
-    board.can_rook_black_big=false; 
-    board.can_rook_white_small=false;
-    board.can_rook_white_big=false;
-    board.can_rook_black_small=false; 
-    for c in s.chars(){
-        if c == ' '{ space+=1; continue; }
-        if space==1 {
-            if c == 'b' { board.black_play = true;  board.white_play = false; }
-            if c == 'w' { board.black_play = false; board.white_play = true;  }
-            continue;
-        }
-        if space==2{
-            if c == 'K'{board.can_rook_white_small=true;}
-            if c == 'Q'{board.can_rook_white_big=true;}
-            if c == 'k'{board.can_rook_black_small=true;}
-            if c == 'q'{board.can_rook_black_big=true;}
-            continue;
-        }
-        if space==3 { /*en passant*/ continue; }
-        if space==4 { board.number_of_half_moves=c.to_ascii_lowercase() as u64; continue; }
-        if space==5 { board.number_of_moves=c.to_ascii_lowercase() as u64; continue; }
-        
-
-        if c.is_ascii_digit() { i+= c as u8 - b'0'; }
-        
-        match c {
-            'r' => { board.set(i.into(), Piece { kind: PieceType::Rook,   color: Color::Black }); i += 1; }
-            'R' => { board.set(i.into(), Piece { kind: PieceType::Rook,   color: Color::White }); i += 1; }
-            'b' => { board.set(i.into(), Piece { kind: PieceType::Bishop, color: Color::Black }); i += 1; }
-            'B' => { board.set(i.into(), Piece { kind: PieceType::Bishop, color: Color::White }); i += 1; }
-            'n' => { board.set(i.into(), Piece { kind: PieceType::Knight, color: Color::Black }); i += 1; }
-            'N' => { board.set(i.into(), Piece { kind: PieceType::Knight, color: Color::White }); i += 1; }
-            'q' => { board.set(i.into(), Piece { kind: PieceType::Queen,  color: Color::Black }); i += 1; }
-            'Q' => { board.set(i.into(), Piece { kind: PieceType::Queen,  color: Color::White }); i += 1; }
-            'k' => { board.set(i.into(), Piece { kind: PieceType::King,   color: Color::Black }); i += 1; }
-            'K' => { board.set(i.into(), Piece { kind: PieceType::King,   color: Color::White }); i += 1; }
-            'p' => { board.set(i.into(), Piece { kind: PieceType::Pawn,   color: Color::Black }); i += 1; }
-            'P' => { board.set(i.into(), Piece { kind: PieceType::Pawn,   color: Color::White }); i += 1; }
-            _ => {}
-        }
+fn color_name(c: Color) -> &'static str {
+    match c {
+        Color::White => "White",
+        Color::Black => "Black",
     }
-    board
 }
 
-fn helper_check_legal_move<const T: usize,const N: usize>(index:usize, board:Board, mut mov: Vec<usize>, moves_pieces: [[(isize, isize); T]; N],p :Piece) -> Vec<usize>{
-    let file = (index % 8) as isize;
-    let rank = (index / 8) as isize;
-    for directions in moves_pieces{
-        for (df, dr) in directions {
-            let nf = file + df;
-            let nr = rank + dr;
-            if !(0..=7).contains(&nf) || !(0..=7).contains(&nr) {
-                continue;
-            }
-            let n_idx = (nr * 8 + nf) as usize;
-            match board.get(n_idx) {
-                Some(other) if other.color != p.color => { mov.push(n_idx); break; }
-                None => mov.push(n_idx),
-                _ => break
-            }
+fn status_text(game: &Game) -> String {
+    let side = game.board.who_play;
+    match game.status {
+        Status::Ongoing if is_in_check(game.board, side) => {
+            format!("{} to move - check!", color_name(side))
         }
+        Status::Ongoing => format!("{} to move", color_name(side)),
+        Status::Checkmate => format!("Checkmate - {} wins", color_name(side.other())),
+        Status::Stalemate => "Stalemate - draw".to_owned(),
+        Status::FiftyMoves => "Draw - 50-move rule".to_owned(),
+        Status::InsufficientMaterial => "Draw - insufficient material".to_owned(),
+        Status::Repetition => "Draw - threefold repetition".to_owned(),
     }
-    mov
 }
 
-fn pawn_moves(index:usize, board:Board, mut mov: Vec<usize>,p :Piece) -> Vec<usize>{
-    let file = (index % 8) as isize;
-    let rank = (index / 8) as isize;
-    let (dir, starting_rank): (isize, isize) = match p.color {
-        Color::White => (-1, 6),
-        Color::Black => ( 1, 1),
+/// Square of the i-th promotion choice: a column from the promotion square towards the centre.
+fn promotion_square(to: usize, i: usize) -> usize {
+    if to < 8 { to + 8 * i } else { to - 8 * i }
+}
+
+/// `side` is the colour the engine played; the evaluation is shown from White's side.
+fn engine_text(r: &SearchResult, side: Color) -> String {
+    let white_score = match side {
+        Color::White => r.score,
+        Color::Black => -r.score,
     };
-
-    let nr = rank + dir;
-    if (0..=7).contains(&nr) {
-        let one_ahead = (nr * 8 + file) as usize;
-        if board.get(one_ahead).is_none() {
-            mov.push(one_ahead);
-            if rank == starting_rank {
-                let nr2 = rank + 2 * dir;
-                if (0..=7).contains(&nr2) {
-                    let two_ahead = (nr2 * 8 + file) as usize;
-                    if board.get(two_ahead).is_none() {
-                        mov.push(two_ahead);
-                    }
-                }
-            }
-        }
-    }
-    if (0..=7).contains(&nr) && file > 0 {
-        let left_diag = (nr * 8 + (file - 1)) as usize;
-        if let Some(other_p) = board.get(left_diag) && other_p.color != p.color{
-            mov.push(left_diag);
-        }
-    }
-    if (0..=7).contains(&nr) && file < 7 {
-        let right_diag = (nr * 8 + (file + 1)) as usize;
-        if let Some(other_p) = board.get(right_diag) && other_p.color != p.color{
-            mov.push(right_diag);
-        }
-    }
-    mov
-}
-
-
-fn check_legal_move(board :Board, index:usize) -> Vec<usize>{
-    let mut mov: Vec<usize> = vec![];
-    if let Some(p) = board.get(index) {
-        mov = match p.kind {
-            PieceType::Knight => helper_check_legal_move(index, board, mov,KNIGHT_MOVES, p),
-            PieceType::King   => {
-                let mut m = helper_check_legal_move(index, board, mov,KING_MOVES,   p);
-                if p.color == Color::White && index == 60 { 
-                    if board.can_rook_white_small && 
-                        board.square[61].is_none() &&
-                        board.square[62].is_none() &&
-                        !is_case_attack(61, board, Color::White) &&
-                        !is_case_attack(62, board, Color::White) &&
-                        board.square[63] == (Some(Piece { kind: PieceType::Rook, color: Color::White }))
-                    {
-                        m.push(63);
-                    }
-                    if board.can_rook_white_big &&
-                        board.square[59].is_none() &&
-                        board.square[58].is_none() &&
-                        board.square[57].is_none() &&
-                        !is_case_attack(60, board, Color::Black) &&
-                        !is_case_attack(59, board, Color::White) &&
-                        !is_case_attack(58, board, Color::White) && 
-                        // En revanche la tour, ainsi que sa case adjacente dans le cas du grand roque, peuvent être menacées
-                        board.square[56] == (Some(Piece { kind: PieceType::Rook, color: Color::White })){
-                        m.push(56);
-                    }
-                }
-                if p.color == Color::Black && index == 4 {
-                    if board.can_rook_black_small &&
-                        board.square[5].is_none() &&
-                        board.square[6].is_none() &&
-                        !is_case_attack(5, board, Color::Black) &&
-                        !is_case_attack(6, board, Color::Black) &&
-                        board.square[7] == (Some(Piece { kind: PieceType::Rook, color: Color::Black })){
-                        m.push(7);
-                    }
-                    if board.can_rook_black_big &&
-                        board.square[3].is_none() &&
-                        board.square[2].is_none() &&
-                        board.square[1].is_none() &&
-                        !is_case_attack(4, board, Color::Black) &&
-                        !is_case_attack(3, board, Color::Black) &&
-                        !is_case_attack(2, board, Color::Black) &&
-                        // En revanche la tour, ainsi que sa case adjacente dans le cas du grand roque, peuvent être menacées
-                        board.square[0] == (Some(Piece { kind: PieceType::Rook, color: Color::Black })){
-                        m.push(0);
-                    }
-                }
-                m
-            },
-            PieceType::Rook   => helper_check_legal_move(index, board, mov,ROOK_MOVES,   p),
-            PieceType::Bishop => helper_check_legal_move(index, board, mov,BISHOP_MOVES, p),
-            PieceType::Queen  => helper_check_legal_move(index, board, mov,QUEEN_MOVES,  p),
-            PieceType::Pawn => pawn_moves(index, board, mov, p),
-        };
-    }
-    mov
-}
-
-fn attacks_from(index: usize, board: Board) -> Vec<usize> {
-    let mut mov: Vec<usize> = vec![];
-    if let Some(p) = board.get(index) {
-        mov = match p.kind {
-            PieceType::Knight => helper_check_legal_move(index, board, mov, KNIGHT_MOVES, p),
-            PieceType::King   => helper_check_legal_move(index, board, mov, KING_MOVES,   p),
-            PieceType::Rook   => helper_check_legal_move(index, board, mov, ROOK_MOVES,   p),
-            PieceType::Bishop => helper_check_legal_move(index, board, mov, BISHOP_MOVES, p),
-            PieceType::Queen  => helper_check_legal_move(index, board, mov, QUEEN_MOVES,  p),
-            PieceType::Pawn   => pawn_attacks(index, mov, p),
-        };
-    }
-    mov
-}
-
-fn pawn_attacks(index: usize, mut mov: Vec<usize>, p: Piece) -> Vec<usize> {
-    let file = (index % 8) as isize;
-    let rank = (index / 8) as isize;
-    let dir: isize = match p.color {
-        Color::White => -1,
-        Color::Black =>  1,
+    let score = if white_score.abs() > MATE - 1000 {
+        let moves = (MATE - white_score.abs() + 1) / 2;
+        format!("{}mate in {moves}", if white_score < 0 { "-" } else { "+" })
+    } else {
+        format!("{:+.2}", white_score as f32 / 100.0)
     };
-    let nr = rank + dir;
-    if !(0..=7).contains(&nr) {
-        return mov;
-    }
-
-    if file > 0 {
-        let left = (nr * 8 + (file - 1)) as usize;
-        mov.push(left);
-    }
-    if file < 7 {
-        let right = (nr * 8 + (file + 1)) as usize;
-        mov.push(right);
-    }
-    mov
+    let best = r.best.map(|m| m.to_string()).unwrap_or_default();
+    format!("Engine: {best}  depth {}  eval {score}", r.depth)
 }
 
-fn is_case_attack(index: usize, board: Board, color: Color) -> bool {
-    for i in 0..64 {
-        if let Some(piece) = board.get(i)
-            && piece.color != color
-            && attacks_from(i, board).contains(&index)
-        {
-            return true;
-        }
-    }
-    false
+fn square_xy(index: usize) -> (f32, f32) {
+    (
+        (index % 8) as f32 * SQUARE_SIZE,
+        (index / 8) as f32 * SQUARE_SIZE,
+    )
 }
 
-fn is_in_check(board :Board,color :Color) -> bool{
-    for i in 0..64 {
-        if let Some(piece) = board.get(i)&& piece.kind == PieceType::King && piece.color == color{
-            return is_case_attack(i, board, color)
-        }
-    }
-    false
-}
-
-fn save_king(board :Board,index: usize) -> Vec<usize> {
-    let pseudo: Vec<usize> = check_legal_move(board, index);
-    let mut legal: Vec<usize> = vec![];
-    let me = match board.get(index) {
-        Some(p) => p.color,
-        None => return legal,
-    };
-    for to in pseudo{
-        let mut tmp: Board = board;
-        tmp.square[to] = tmp.square[index];
-        tmp.square[index] = None; 
-        if !is_in_check(tmp, me) {
-            legal.push(to);
-        }
-    }
-    legal
-}
-
-fn is_checkmate(board :Board, index :usize) -> bool{
-    if let Some(piece) = board.get(index) && is_in_check(board,piece.color) && save_king(board, index) == vec![]{
-        return true;
-    }
-    false
-}
-
-#[macroquad::main("Chess")]
+#[macroquad::main(window_conf)]
 async fn main() {
-    let b_b = load_texture("pieces/bB.png").await.unwrap();
-    let b_k = load_texture("pieces/bK.png").await.unwrap();
-    let b_n = load_texture("pieces/bN.png").await.unwrap();
-    let b_p = load_texture("pieces/bP.png").await.unwrap();
-    let b_q = load_texture("pieces/bQ.png").await.unwrap();
-    let b_r = load_texture("pieces/bR.png").await.unwrap();
-    let w_b = load_texture("pieces/wB.png").await.unwrap();
-    let w_k = load_texture("pieces/wK.png").await.unwrap();
-    let w_n = load_texture("pieces/wN.png").await.unwrap();
-    let w_p = load_texture("pieces/wP.png").await.unwrap();
-    let w_q = load_texture("pieces/wQ.png").await.unwrap();
-    let w_r = load_texture("pieces/wR.png").await.unwrap();
+    let mut textures = vec![];
+    for name in PIECE_FILES {
+        let path = format!("pieces/{name}.png");
+        let texture = load_texture(&path)
+            .await
+            .unwrap_or_else(|e| panic!("cannot load {path} (run from the repo root): {e}"));
+        textures.push(texture);
+    }
+    let draw_piece = |p: Piece, index: usize| {
+        let (x, y) = square_xy(index);
+        draw_texture_ex(
+            &textures[p.kind as usize * 2 + p.color as usize],
+            x,
+            y,
+            WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(SQUARE_SIZE, SQUARE_SIZE)),
+                ..Default::default()
+            },
+        )
+    };
 
-    let mut board = Board::new();
-    let mut who_play: Color = Color::White;
-    let s = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1".to_string();
-    board = fen_to_board(board,s);
+    let mut game = Game::new();
     let mut selected: Option<usize> = None;
-    let mut move_pieces: Option<Vec<usize>> = None;
+    let mut move_pieces: Vec<usize> = vec![];
+    // A pawn move waiting for the player to pick the promotion piece.
+    let mut promotion: Option<Move> = None;
+    // Who the engine plays; None = human vs human. M cycles through the modes.
+    let mut engine_color = Some(Color::Black);
+    let mut thinking: Option<Thinking> = None;
+    let mut engine_info = String::new();
     loop {
+        if is_key_pressed(KeyCode::R) {
+            game = Game::new();
+            selected = None;
+            move_pieces.clear();
+            promotion = None;
+            thinking = None; // stops a search still running for the old game
+            engine_info.clear();
+        }
+        if is_key_pressed(KeyCode::M) {
+            engine_color = match engine_color {
+                Some(Color::Black) => Some(Color::White),
+                Some(Color::White) => None,
+                None => Some(Color::Black),
+            };
+            selected = None;
+            move_pieces.clear();
+            promotion = None;
+            thinking = None;
+        }
+
+        if thinking.is_none()
+            && game.status == Status::Ongoing
+            && engine_color == Some(game.board.who_play)
+        {
+            let (tx, rx) = mpsc::channel();
+            let stop = Arc::new(AtomicBool::new(false));
+            let (board, history, flag) = (game.board, game.history.clone(), stop.clone());
+            thread::spawn(move || {
+                let result = engine::search(&board, &history, ENGINE_MAX_DEPTH, ENGINE_TIME, &flag);
+                let _ = tx.send(result); // fails only if the game was restarted
+            });
+            thinking = Some(Thinking { rx, stop });
+        }
+        if let Some(t) = &thinking {
+            match t.rx.try_recv() {
+                Ok(result) => {
+                    thinking = None;
+                    engine_info = engine_text(&result, game.board.who_play);
+                    if let Some(m) = result.best {
+                        game.play(m);
+                    }
+                }
+                Err(TryRecvError::Empty) => {}
+                // The engine thread panicked. Leave the board to the humans instead
+                // of starting a new search (that would likely panic again) every frame.
+                Err(TryRecvError::Disconnected) => {
+                    thinking = None;
+                    engine_color = None;
+                    engine_info = "Engine crashed (see terminal)".to_owned();
+                }
+            }
+        }
+
         clear_background(WHITE);
-        window::set_window_size((SQUARE_SIZE*8.0) as u32, (SQUARE_SIZE*8.0) as u32);
-
         for i in 0..64 {
-            let file = i % 8;
-            let rank = i / 8;
-            let x = (i % 8) as f32 * SQUARE_SIZE;
-            let y = rank as f32 * SQUARE_SIZE;
-
-            let light = (file + rank) % 2 == 0;
+            let (x, y) = square_xy(i);
+            let light = (i % 8 + i / 8) % 2 == 0;
             let bg = if light { BEIGE } else { BROWN };
             draw_rectangle(x, y, SQUARE_SIZE, SQUARE_SIZE, bg);
-            if let Some(ref arr) = move_pieces{
-                for j in arr{
-                    if *j == i {draw_circle(x+SQUARE_SIZE/2.0, y+SQUARE_SIZE/2.0, SQUARE_SIZE/4.0, macroquad::color::Color::new(0.0, 0.0, 1.0, 0.4));}
-                }
-                
+            if game.last_move.is_some_and(|m| m.from == i || m.to == i) {
+                draw_rectangle(x, y, SQUARE_SIZE, SQUARE_SIZE, LAST_MOVE);
+            }
+            if move_pieces.contains(&i) {
+                let half = SQUARE_SIZE / 2.0;
+                draw_circle(x + half, y + half, SQUARE_SIZE / 4.0, MOVE_DOT);
             }
             if selected == Some(i) {
-                draw_rectangle(x, y, SQUARE_SIZE, SQUARE_SIZE,
-                    macroquad::color::Color::new(0.0, 1.0, 0.0, 0.4));
+                draw_rectangle(x, y, SQUARE_SIZE, SQUARE_SIZE, SELECTED);
             }
-            if let Some(p) = board.get(i) {
-                let texture = match (p.kind, p.color) {
-                    (PieceType::King,   Color::White) => &w_k,
-                    (PieceType::King,   Color::Black) => &b_k,
-                    (PieceType::Pawn,   Color::White) => &w_p,
-                    (PieceType::Pawn,   Color::Black) => &b_p,
-                    (PieceType::Knight, Color::White) => &w_n,
-                    (PieceType::Knight, Color::Black) => &b_n,
-                    (PieceType::Bishop, Color::White) => &w_b,
-                    (PieceType::Bishop, Color::Black) => &b_b,
-                    (PieceType::Rook,   Color::White) => &w_r,
-                    (PieceType::Rook,   Color::Black) => &b_r,
-                    (PieceType::Queen,  Color::White) => &w_q,
-                    (PieceType::Queen,  Color::Black) => &b_q,
+            if let Some(p) = game.board.get(i) {
+                draw_piece(p, i);
+            }
+        }
+        if let Some(m) = promotion {
+            draw_rectangle(0.0, 0.0, BOARD_SIZE, BOARD_SIZE, SHADOW);
+            for (i, kind) in PROMOTION_CHOICES.into_iter().enumerate() {
+                let square = promotion_square(m.to, i);
+                let (x, y) = square_xy(square);
+                draw_rectangle(x, y, SQUARE_SIZE, SQUARE_SIZE, BEIGE);
+                let color = game.board.who_play;
+                draw_piece(Piece { kind, color }, square);
+            }
+        }
+        let bar = BOARD_SIZE + 25.0;
+        let mut status = status_text(&game);
+        if thinking.is_some() {
+            status.push_str("  (engine thinking...)");
+        }
+        draw_text(status, 10.0, bar, 28.0, BLACK);
+        let mode = match engine_color {
+            Some(Color::Black) => "you (White) vs engine",
+            Some(Color::White) => "engine vs you (Black)",
+            None => "human vs human",
+        };
+        let help = format!("R: restart   M: {mode}   {engine_info}");
+        draw_text(help, 10.0, bar + 26.0, 20.0, BLACK);
+
+        let (mouse_x, mouse_y) = mouse_position();
+        if is_mouse_button_pressed(MouseButton::Left)
+            && (0.0..BOARD_SIZE).contains(&mouse_x)
+            && (0.0..BOARD_SIZE).contains(&mouse_y)
+        {
+            let index = (mouse_x / SQUARE_SIZE) as usize + 8 * (mouse_y / SQUARE_SIZE) as usize;
+            if let Some(m) = promotion.take() {
+                // A click outside the choices cancels the move.
+                if let Some(i) = (0..4).find(|&i| promotion_square(m.to, i) == index) {
+                    game.play(Move {
+                        promotion: Some(PROMOTION_CHOICES[i]),
+                        ..m
+                    });
+                }
+            } else if let Some(from) = selected
+                && move_pieces.contains(&index)
+            {
+                let m = Move {
+                    from,
+                    to: index,
+                    promotion: None,
                 };
-                draw_texture_ex(
-                    texture, x, y, WHITE,
-                    DrawTextureParams {
-                        dest_size: Some(vec2(SQUARE_SIZE, SQUARE_SIZE)),
-                        ..Default::default()
-                    },
-                )
-            }
-        }
-        if is_mouse_button_pressed(MouseButton::Left){
-            let mouse_pos_start = mouse_position();
-            let a_to_x = (mouse_pos_start.0 / SQUARE_SIZE) as usize;
-            let b_to_y = (mouse_pos_start.1 / SQUARE_SIZE) as usize;
-            let index_start = a_to_x+8*b_to_y;
-            if selected.is_none() && board.square[index_start].is_some() && let Some(a) = board.get(index_start) && a.color == who_play{
-                selected = Some(index_start);
-                if move_pieces.is_none(){
-                    if is_checkmate(board, index_start){return;}
-                    move_pieces = Some(save_king(board, index_start));
+                let pawn = game
+                    .board
+                    .get(from)
+                    .is_some_and(|p| p.kind == PieceType::Pawn);
+                if pawn && !(8..56).contains(&index) {
+                    promotion = Some(m);
+                } else {
+                    game.play(m);
                 }
+                selected = None;
+                move_pieces.clear();
+            } else if game.status == Status::Ongoing
+                && engine_color != Some(game.board.who_play)
+                && selected != Some(index)
+                && game
+                    .board
+                    .get(index)
+                    .is_some_and(|p| p.color == game.board.who_play)
+            {
+                selected = Some(index);
+                move_pieces = save_king(game.board, index);
+            } else {
+                selected = None;
+                move_pieces.clear();
             }
-            else{
-                if let Some(index_start2) = selected{
-                    let mouse_pos_end = mouse_position();
-                    let a_to_x_end = (mouse_pos_end.0 / SQUARE_SIZE) as usize;
-                    let b_to_y_end = (mouse_pos_end.1 / SQUARE_SIZE) as usize;
-                    let index_end = a_to_x_end+8*b_to_y_end;
-                    if index_end == index_start2{selected=None;move_pieces=None;}
-                    else{
-                        let piece = board.square[index_start2];
-                        if piece == Some(Piece { kind: PieceType::King, color: Color::White }) && matches!(&move_pieces, Some(c) if c.contains(&index_end))
-                        {
-                            if index_end == 63 {
-                                board.square[62] = Some(Piece { kind: PieceType::King, color: Color::White });
-                                board.square[61] = Some(Piece { kind: PieceType::Rook, color: Color::White });
-                                board.square[index_end] = None;
-                            }
-                            else if index_end == 56 {
-                                board.square[58] = Some(Piece { kind: PieceType::King, color: Color::White });
-                                board.square[59] = Some(Piece { kind: PieceType::Rook, color: Color::White });
-                                board.square[index_end] = None;
-                            }
-                            else {board.square[index_end] = piece;}
-
-                            board.square[index_start2] = None;
-                            selected=None;
-                            move_pieces=None;
-                            board.can_rook_white_big=false;
-                            board.can_rook_white_small=false;
-                        }
-                        else if piece == Some(Piece { kind: PieceType::King, color: Color::Black }) && matches!(&move_pieces, Some(c) if c.contains(&index_end))
-                        {
-                            if index_end == 7 {
-                                board.square[6] = Some(Piece { kind: PieceType::King, color: Color::Black });
-                                board.square[5] = Some(Piece { kind: PieceType::Rook, color: Color::Black });
-                                board.square[index_end] = None;
-                            }
-                            else if index_end == 0 {
-                                board.square[2] = Some(Piece { kind: PieceType::King, color: Color::Black });
-                                board.square[3] = Some(Piece { kind: PieceType::Rook, color: Color::Black });
-                                board.square[index_end] = None;
-                            }
-                            else {board.square[index_end] = piece;}
-
-                            board.square[index_start2] = None;
-                            selected=None;
-                            move_pieces=None;
-                            board.can_rook_black_big=false;
-                            board.can_rook_black_small=false;
-                        }
-                        else if let Some(ref coor) = move_pieces && coor.contains(&index_end) {
-                            board.square[index_end] = piece;
-                            board.square[index_start2] = None;
-                            selected=None;
-                            move_pieces=None;
-                        }
-                        if piece == (Some(Piece { kind: PieceType::Rook, color: Color::White })) && index_start2 == 63{
-                            board.can_rook_white_small=false;
-                        }
-                        else if piece == (Some(Piece { kind: PieceType::Rook, color: Color::White })) && index_start2 == 56{
-                            board.can_rook_white_big=false;
-                        }
-                        else if piece == (Some(Piece { kind: PieceType::Rook, color: Color::Black })) && index_start2 == 7{
-                            board.can_rook_black_small=false;
-                        }
-                        else if piece == (Some(Piece { kind: PieceType::Rook, color: Color::Black })) && index_start2 == 0{
-                            board.can_rook_black_big=false;
-                        }
-                        if index_end == 63 { board.can_rook_white_small = false; }
-                        if index_end == 56 { board.can_rook_white_big   = false; }
-                        if index_end == 7  { board.can_rook_black_small = false; }
-                        if index_end == 0  { board.can_rook_black_big   = false; }
-                        board.number_of_half_moves+=1;
-                    }
-                }
-            }   
-        }
-        if who_play == Color::White && !board.number_of_half_moves.is_multiple_of(2){ 
-            who_play = Color::Black;
-        }else if who_play == Color::Black && board.number_of_half_moves.is_multiple_of(2){
-            board.number_of_moves+=1;
-            who_play = Color::White;
         }
         next_frame().await;
     }
